@@ -1,0 +1,7 @@
+# Settings AgIsoStack++ needs (from the library's ESP32 example)
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+CONFIG_FREERTOS_HZ=250
+
+# XIAO ESP32S3: send logs to the USB-C port (USB Serial/JTAG) instead of UART0.
+# UART0 sits on D6/D7, so this also frees D7 for the MCP2515 CS line.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
