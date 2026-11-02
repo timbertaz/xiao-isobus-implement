@@ -1,18 +1,30 @@
-// XIAO ESP32S3 + MCP2515 — ISOBUS implement (Virtual Terminal client)
+// XIAO ESP32S3 — ISOBUS implement (Virtual Terminal client)
 //
-// Based on the AgIsoStack++ example "esp32_platformio_object_pool", with the
-// built-in TWAI driver swapped for the library's MCP2515 driver.
+// Based on the AgIsoStack++ example "esp32_platformio_object_pool".
+//
+// CAN hardware (choose with CAN_USE_MCP2515 below):
+//   0 = SN65HVD230 transceiver on the ESP32's built-in CAN controller (TWAI)  <- default
+//   1 = MCP2515 module over SPI (the old setup with the resistor divider)
 //
 // What it does:
 //   1. Claims an ISOBUS address (you'll see 0x18EEFFxx frames on the bus)
 //   2. Looks for a Virtual Terminal (VT) on the bus
 //   3. When a VT is found: uploads the example object pool and handles its buttons
 //
-// Wiring is unchanged from the xiao-can-test project.
+// SN65HVD230 wiring:
+//   XIAO 3V3 -> 3V3      XIAO GND -> GND
+//   XIAO D4  -> CTX (TX)  XIAO D5 -> CRX (RX)
+//   CANH / CANL -> the bus (no termination resistor here if both bus ends are already terminated)
+
+#define CAN_USE_MCP2515 0
 
 #include "isobus/hardware_integration/can_hardware_interface.hpp"
+#if CAN_USE_MCP2515
 #include "isobus/hardware_integration/mcp2515_can_interface.hpp"
 #include "isobus/hardware_integration/spi_interface_esp.hpp"
+#else
+#include "isobus/hardware_integration/twai_plugin.hpp"
+#endif
 #include "isobus/isobus/can_network_manager.hpp"
 #include "isobus/isobus/can_partnered_control_function.hpp"
 #include "isobus/isobus/can_stack_logger.hpp"
@@ -20,7 +32,10 @@
 #include "isobus/isobus/isobus_virtual_terminal_client_update_helper.hpp"
 
 #include "console_logger.cpp"
+#include "driver/gpio.h"
+#if CAN_USE_MCP2515
 #include "driver/spi_master.h"
+#endif
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -32,10 +47,15 @@ static const char *TAG = "implement";
 
 // ---------------- Pins (XIAO label -> ESP32-S3 GPIO) ----------------
 // D0=1 D1=2 D2=3 D3=4 D4=5 D5=6 D6=43 D7=44 D8=7 D9=8 D10=9
+// SN65HVD230. Not D6/D7: those are UART0, which prints boot messages and would put junk on the bus.
+#define PIN_CAN_TX GPIO_NUM_5 // D4
+#define PIN_CAN_RX GPIO_NUM_6 // D5
+
+// MCP2515 (only used when CAN_USE_MCP2515 is 1)
 #define PIN_SCK   7     // D8
 #define PIN_MISO  8     // D9  (through the 1k/2k divider)
 #define PIN_MOSI  9     // D10
-#define PIN_CS    1    // D7  <-- your CS pin as a plain GPIO number
+#define PIN_CS    1     // D0
 
 // ---------------- MCP2515 bit timing: 8 MHz crystal, 250 kbit/s ----------------
 // 16 time quanta per bit, sample point 14/16 = 87.5 % (what ISO 11783-2 asks for)
@@ -95,14 +115,21 @@ extern "C" const std::uint8_t object_pool_start[] asm("_binary_object_pool_iop_s
 extern "C" const std::uint8_t object_pool_end[] asm("_binary_object_pool_iop_end");
 
 // These must outlive app_main's setup code, so they're static
+#if CAN_USE_MCP2515
 static spi_device_interface_config_t spiDeviceConfig = {};
 static std::unique_ptr<isobus::SPIInterfaceESP> spiInterface;
+#else
+static twai_general_config_t twaiConfig = TWAI_GENERAL_CONFIG_DEFAULT(PIN_CAN_TX, PIN_CAN_RX, TWAI_MODE_NORMAL);
+static twai_timing_config_t twaiTiming = TWAI_TIMING_CONFIG_250KBITS(); // ISOBUS: 250 kbit/s
+static twai_filter_config_t twaiFilter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+#endif
 
 extern "C" void app_main()
 {
 	vTaskDelay(pdMS_TO_TICKS(2000)); // give the USB serial monitor time to connect
 	ESP_LOGI(TAG, "=== XIAO ISOBUS implement starting ===");
 
+#if CAN_USE_MCP2515
 	// ---- SPI bus for the MCP2515 ----
 	spi_bus_config_t busConfig = {};
 	busConfig.mosi_io_num = PIN_MOSI;
@@ -125,6 +152,14 @@ extern "C" void app_main()
 
 	// ---- CAN stack with the MCP2515 driver ----
 	auto canDriver = std::make_shared<isobus::MCP2515CANInterface>(spiInterface.get(), MCP_CNF1, MCP_CNF2, MCP_CNF3);
+	const char *canName = "MCP2515";
+#else
+	// ---- Built-in CAN controller + SN65HVD230 ----
+	twaiConfig.rx_queue_len = 32;
+	twaiConfig.tx_queue_len = 32; // object pool upload sends long bursts
+	auto canDriver = std::make_shared<isobus::TWAIPlugin>(&twaiConfig, &twaiTiming, &twaiFilter);
+	const char *canName = "Built-in CAN (SN65HVD230)";
+#endif
 
 	isobus::CANStackLogger::set_can_stack_logger_sink(&logger);
 	isobus::CANStackLogger::set_log_level(isobus::CANStackLogger::LoggingLevel::Info); // Debug for more detail
@@ -133,11 +168,11 @@ extern "C" void app_main()
 
 	if (!isobus::CANHardwareInterface::start() || !canDriver->get_is_valid())
 	{
-		ESP_LOGE(TAG, "CAN start FAILED - the MCP2515 did not answer over SPI. Check wiring/CS pin.");
+		ESP_LOGE(TAG, "CAN start FAILED (%s). Check the wiring.", canName);
 	}
 	else
 	{
-		ESP_LOGI(TAG, "MCP2515 running at 250 kbit/s");
+		ESP_LOGI(TAG, "%s running at 250 kbit/s", canName);
 	}
 
 	// ---- Our identity on the bus (ISO NAME) ----
