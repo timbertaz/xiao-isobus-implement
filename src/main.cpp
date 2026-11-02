@@ -42,6 +42,7 @@
 #include "objectPoolObjects.h"
 
 #include <memory>
+#include <thread>
 
 static const char *TAG = "implement";
 
@@ -124,7 +125,11 @@ static twai_timing_config_t twaiTiming = TWAI_TIMING_CONFIG_250KBITS(); // ISOBU
 static twai_filter_config_t twaiFilter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 #endif
 
-extern "C" void app_main()
+// Everything runs in a std::thread (a pthread): this AgIsoStack++ version calls
+// std::this_thread::get_id() in VirtualTerminalClient::initialize(), and on ESP-IDF that
+// only works inside a pthread. Called from the plain FreeRTOS main task it aborts with
+// "assert failed: pthread_self ... Failed to find current thread ID!".
+static void implement_main()
 {
 	vTaskDelay(pdMS_TO_TICKS(2000)); // give the USB serial monitor time to connect
 	ESP_LOGI(TAG, "=== XIAO ISOBUS implement starting ===");
@@ -215,4 +220,10 @@ extern "C" void app_main()
 		         vtClient->get_is_connected() ? "yes" : "no");
 		vTaskDelay(pdMS_TO_TICKS(3000));
 	}
+}
+
+extern "C" void app_main()
+{
+	std::thread implementThread(implement_main);
+	implementThread.join(); // never returns: implement_main loops forever
 }
