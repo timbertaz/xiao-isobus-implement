@@ -13,7 +13,7 @@
 //
 // SN65HVD230 wiring:
 //   XIAO 3V3 -> 3V3      XIAO GND -> GND
-//   XIAO D4  -> CTX (TX)  XIAO D5 -> CRX (RX)
+//   XIAO D4  -> CTX (TX)  XIAO D2 -> CRX (RX)
 //   CANH / CANL -> the bus (no termination resistor here if both bus ends are already terminated)
 
 #define CAN_USE_MCP2515 0
@@ -50,7 +50,7 @@ static const char *TAG = "implement";
 // D0=1 D1=2 D2=3 D3=4 D4=5 D5=6 D6=43 D7=44 D8=7 D9=8 D10=9
 // SN65HVD230. Not D6/D7: those are UART0, which prints boot messages and would put junk on the bus.
 #define PIN_CAN_TX GPIO_NUM_5 // D4
-#define PIN_CAN_RX GPIO_NUM_6 // D5
+#define PIN_CAN_RX GPIO_NUM_3 // D2 (D5 on this XIAO appears damaged)
 
 // MCP2515 (only used when CAN_USE_MCP2515 is 1)
 #define PIN_SCK   7     // D8
