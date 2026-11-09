@@ -9,7 +9,12 @@
 // What it does:
 //   1. Claims an ISOBUS address (you'll see 0x18EEFFxx frames on the bus)
 //   2. Looks for a Virtual Terminal (VT) on the bus
-//   3. When a VT is found: uploads the example object pool and handles its buttons
+//   3. When a VT is found: uploads the Norén screen (src/object_pool, made by tools/make_pool.py)
+//   4. Shows the tractor's speed, rear hitch and rear PTO, read from the tractor's ISOBUS
+//      messages. With no tractor on the bus (the bench) it simulates them.
+//   5. Three buttons switch the implement's lights: outputs D0, D1, D3 (3.3 V, max ~10 mA each:
+//      an LED with a 330 ohm resistor, or the input of a relay/MOSFET module). The XIAO's own
+//      orange LED follows the work light, so you can see it without wiring anything.
 //
 // SN65HVD230 wiring:
 //   XIAO 3V3 -> 3V3      XIAO GND -> GND
@@ -39,7 +44,10 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "objectPoolObjects.h"
+#include "noren_pool.hpp"
+
+#include <atomic>
+#include <cmath>
 
 #include <memory>
 #include <thread>
@@ -52,7 +60,13 @@ static const char *TAG = "implement";
 #define PIN_CAN_TX GPIO_NUM_5 // D4
 #define PIN_CAN_RX GPIO_NUM_3 // D2 (D5 on this XIAO appears damaged)
 
-// MCP2515 (only used when CAN_USE_MCP2515 is 1)
+// Implement light outputs (high = on) and the XIAO's own LED (low = on)
+#define PIN_LIGHT_WORK   GPIO_NUM_1  // D0
+#define PIN_LIGHT_BEACON GPIO_NUM_2  // D1
+#define PIN_LIGHT_REAR   GPIO_NUM_4  // D3
+#define PIN_ONBOARD_LED  GPIO_NUM_21
+
+// MCP2515 (only used when CAN_USE_MCP2515 is 1; its CS would clash with the work light on D0)
 #define PIN_SCK   7     // D8
 #define PIN_MISO  8     // D9  (through the 1k/2k divider)
 #define PIN_MOSI  9     // D10
@@ -70,49 +84,140 @@ static constexpr std::uint8_t MCP_CNF3 = 0x01;
 static std::shared_ptr<isobus::VirtualTerminalClient> vtClient = nullptr;
 static std::shared_ptr<isobus::VirtualTerminalClientUpdateHelper> vtHelper = nullptr;
 
-// ---------------- Button / soft key handling (same as the library example) ----------------
-static void handle_softkey_event(const isobus::VirtualTerminalClient::VTKeyEvent &event)
+// ---------------- Tractor data from ISOBUS (ISO 11783-7 tractor ECU messages) ----------------
+// Filled in by the CAN stack's thread, read by the main loop.
+static std::atomic<std::uint32_t> groundSpeedMmS{ 0xFFFFFFFF }; // mm/s, 0xFFFFFFFF = not available
+static std::atomic<std::uint32_t> wheelSpeedMmS{ 0xFFFFFFFF };
+static std::atomic<std::uint32_t> hitchTenths{ 0xFFFFFFFF };    // rear hitch position, 0.1 %
+static std::atomic<std::uint32_t> ptoRpm{ 0xFFFFFFFF };         // rear PTO shaft speed
+static std::atomic<std::uint32_t> lastTractorMessageMs{ 0 };
+static std::atomic<bool> tractorSeen{ false };
+
+static std::uint32_t now_ms()
 {
-	if (event.keyNumber == 0)
+	return xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+static void tractor_heard()
+{
+	lastTractorMessageMs = now_ms();
+	tractorSeen = true;
+}
+
+// Ground-based (radar) and wheel-based speed: bytes 0-1 = speed, 0.001 m/s per bit
+static void on_ground_speed(const isobus::CANMessage &message, void *)
+{
+	std::uint16_t raw = message.get_uint16_at(0);
+	groundSpeedMmS = (raw < 0xFB00) ? raw : 0xFFFFFFFF;
+	tractor_heard();
+}
+
+static void on_wheel_speed(const isobus::CANMessage &message, void *)
+{
+	std::uint16_t raw = message.get_uint16_at(0);
+	wheelSpeedMmS = (raw < 0xFB00) ? raw : 0xFFFFFFFF;
+	tractor_heard();
+}
+
+// Primary (rear) hitch status: byte 0 = position, 0.4 % per bit
+static void on_rear_hitch(const isobus::CANMessage &message, void *)
+{
+	std::uint8_t raw = message.get_uint8_at(0);
+	hitchTenths = (raw <= 250) ? raw * 4u : 0xFFFFFFFF;
+	tractor_heard();
+}
+
+// Primary (rear) PTO output shaft: bytes 0-1 = speed, 0.125 rpm per bit
+static void on_rear_pto(const isobus::CANMessage &message, void *)
+{
+	std::uint16_t raw = message.get_uint16_at(0);
+	ptoRpm = (raw < 0xFB00) ? (raw / 8u) : 0xFFFFFFFF;
+	tractor_heard();
+}
+
+constexpr std::uint32_t PGN_WHEEL_SPEED = 0xFE48;  // 65096
+constexpr std::uint32_t PGN_GROUND_SPEED = 0xFE49; // 65097
+constexpr std::uint32_t PGN_REAR_HITCH = 0xFE45;   // 65093
+constexpr std::uint32_t PGN_REAR_PTO = 0xFE43;     // 65091
+
+// ---------------- Implement lights ----------------
+struct Light
+{
+	const char *name;
+	gpio_num_t pin;
+	std::uint16_t button;
+	std::uint16_t stateText;
+	bool on;
+};
+
+static Light lights[] = {
+	{ "Work", PIN_LIGHT_WORK, pool::BTN_WORK, pool::STR_WORK_STATE, false },
+	{ "Beacon", PIN_LIGHT_BEACON, pool::BTN_BEACON, pool::STR_BEACON_STATE, false },
+	{ "Rear", PIN_LIGHT_REAR, pool::BTN_REAR, pool::STR_REAR_STATE, false },
+};
+
+// Show a light's state on the terminal: button colour + ON/OFF text
+static void show_light(const Light &light)
+{
+	if ((nullptr != vtClient) && vtClient->get_is_connected())
 	{
-		vtHelper->set_active_data_or_alarm_mask(example_WorkingSet, mainRunscreen_DataMask);
+		vtClient->send_change_background_colour(light.button, light.on ? pool::COLOUR_LIGHT_ON : pool::COLOUR_LIGHT_OFF);
+		vtClient->send_change_background_colour(light.stateText, light.on ? pool::COLOUR_LIGHT_ON : pool::COLOUR_LIGHT_OFF);
+		vtClient->send_change_string_value(light.stateText, light.on ? "ON " : "OFF");
 	}
-	if (event.keyEvent == isobus::VirtualTerminalClient::KeyActivationCode::ButtonUnlatchedOrReleased)
+}
+
+static void set_light(Light &light, bool on)
+{
+	light.on = on;
+	gpio_set_level(light.pin, on ? 1 : 0);
+	if (light.pin == PIN_LIGHT_WORK)
 	{
-		switch (event.objectID)
+		gpio_set_level(PIN_ONBOARD_LED, on ? 0 : 1); // the XIAO's LED is on when low
+	}
+	ESP_LOGI(TAG, "%s light %s", light.name, on ? "ON" : "OFF");
+	show_light(light);
+}
+
+static void setup_light_outputs()
+{
+	gpio_config_t config = {};
+	config.pin_bit_mask = (1ULL << PIN_LIGHT_WORK) | (1ULL << PIN_LIGHT_BEACON) | (1ULL << PIN_LIGHT_REAR) | (1ULL << PIN_ONBOARD_LED);
+	config.mode = GPIO_MODE_OUTPUT;
+	gpio_config(&config);
+	for (auto &light : lights)
+	{
+		gpio_set_level(light.pin, 0);
+	}
+	gpio_set_level(PIN_ONBOARD_LED, 1);
+}
+
+// ---------------- Buttons on the terminal ----------------
+// Events arrive in the VT client's thread; they're queued as "toggle requests" for the main loop.
+static std::atomic<std::uint32_t> toggleRequests{ 0 }; // bit per light
+static std::atomic<bool> allOffRequest{ false };
+
+static void handle_button_event(const isobus::VirtualTerminalClient::VTKeyEvent &event)
+{
+	if (event.keyEvent != isobus::VirtualTerminalClient::KeyActivationCode::ButtonUnlatchedOrReleased)
+	{
+		return; // switch on release, like a real switch panel
+	}
+	for (std::size_t i = 0; i < sizeof(lights) / sizeof(lights[0]); i++)
+	{
+		if (event.objectID == lights[i].button)
 		{
-			case alarm_SoftKey:
-				ESP_LOGI(TAG, "Soft key: alarm -> showing the alarm screen");
-				vtHelper->set_active_data_or_alarm_mask(example_WorkingSet, example_AlarmMask);
-				break;
-			case acknowledgeAlarm_SoftKey:
-				ESP_LOGI(TAG, "Soft key: acknowledge -> back to the main screen");
-				vtHelper->set_active_data_or_alarm_mask(example_WorkingSet, mainRunscreen_DataMask);
-				break;
-			default:
-				break;
+			toggleRequests |= (1u << i);
 		}
 	}
 }
 
-static void handle_button_event(const isobus::VirtualTerminalClient::VTKeyEvent &event)
+static void handle_softkey_event(const isobus::VirtualTerminalClient::VTKeyEvent &event)
 {
-	if ((event.keyEvent == isobus::VirtualTerminalClient::KeyActivationCode::ButtonUnlatchedOrReleased) ||
-	    (event.keyEvent == isobus::VirtualTerminalClient::KeyActivationCode::ButtonStillHeld))
+	if ((event.keyEvent == isobus::VirtualTerminalClient::KeyActivationCode::ButtonUnlatchedOrReleased) &&
+	    (event.objectID == pool::KEY_ALL_OFF))
 	{
-		switch (event.objectID)
-		{
-			case Plus_Button:
-				vtHelper->increase_numeric_value(ButtonExampleNumber_VarNum);
-				ESP_LOGI(TAG, "Button + -> value %ld", static_cast<long>(vtHelper->get_numeric_value(ButtonExampleNumber_VarNum)) - 214748364L);
-				break;
-			case Minus_Button:
-				vtHelper->decrease_numeric_value(ButtonExampleNumber_VarNum);
-				ESP_LOGI(TAG, "Button - -> value %ld", static_cast<long>(vtHelper->get_numeric_value(ButtonExampleNumber_VarNum)) - 214748364L);
-				break;
-			default:
-				break;
-		}
+		allOffRequest = true;
 	}
 }
 
@@ -136,7 +241,8 @@ static twai_filter_config_t twaiFilter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 static void implement_main()
 {
 	vTaskDelay(pdMS_TO_TICKS(2000)); // give the USB serial monitor time to connect
-	ESP_LOGI(TAG, "=== XIAO ISOBUS implement starting ===");
+	ESP_LOGI(TAG, "=== XIAO ISOBUS implement (Norén demo) starting ===");
+	setup_light_outputs();
 
 #if CAN_USE_MCP2515
 	// ---- SPI bus for the MCP2515 ----
@@ -205,24 +311,112 @@ static void implement_main()
 
 	// ---- VT client with the example object pool ----
 	vtClient = std::make_shared<isobus::VirtualTerminalClient>(partnerVT, implementCF);
-	vtClient->set_object_pool(0, object_pool_start, (object_pool_end - object_pool_start), "ais1");
+	// The label tells the terminal which version of the screen this is: change it whenever the
+	// pool changes, or the terminal shows its stored copy of the old one.
+	vtClient->set_object_pool(0, object_pool_start, (object_pool_end - object_pool_start), "noren1");
 	vtClient->get_vt_soft_key_event_dispatcher().add_listener(handle_softkey_event);
 	vtClient->get_vt_button_event_dispatcher().add_listener(handle_button_event);
 	vtClient->initialize(true);
 
 	vtHelper = std::make_shared<isobus::VirtualTerminalClientUpdateHelper>(vtClient);
-	vtHelper->add_tracked_numeric_value(ButtonExampleNumber_VarNum, 214748364); // pool offset, = 0 on screen
+	vtHelper->add_tracked_numeric_value(pool::VAR_SPEED, 0);
+	vtHelper->add_tracked_numeric_value(pool::VAR_HITCH, 0);
+	vtHelper->add_tracked_numeric_value(pool::VAR_PTO, 0);
 	vtHelper->initialize();
 
-	// ---- Status every 3 s ----
+	// Tractor ECU broadcasts
+	isobus::CANNetworkManager::CANNetwork.add_global_parameter_group_number_callback(PGN_GROUND_SPEED, on_ground_speed, nullptr);
+	isobus::CANNetworkManager::CANNetwork.add_global_parameter_group_number_callback(PGN_WHEEL_SPEED, on_wheel_speed, nullptr);
+	isobus::CANNetworkManager::CANNetwork.add_global_parameter_group_number_callback(PGN_REAR_HITCH, on_rear_hitch, nullptr);
+	isobus::CANNetworkManager::CANNetwork.add_global_parameter_group_number_callback(PGN_REAR_PTO, on_rear_pto, nullptr);
+
+	// ---- Main loop: 5 updates per second ----
+	bool wasConnected = false;
+	bool showingTractor = false;
+	std::uint32_t lastStatusLog = 0;
 	while (true)
 	{
-		ESP_LOGI(TAG, "address %s 0x%02X | VT found: %s | VT connected: %s",
-		         implementCF->get_address_valid() ? "claimed" : "not yet",
-		         implementCF->get_address(),
-		         partnerVT->get_address_valid() ? "yes" : "no",
-		         vtClient->get_is_connected() ? "yes" : "no");
-		vTaskDelay(pdMS_TO_TICKS(3000));
+		const std::uint32_t now = now_ms();
+		const bool connected = vtClient->get_is_connected();
+
+		// Buttons pressed on the terminal
+		std::uint32_t toggles = toggleRequests.exchange(0);
+		for (std::size_t i = 0; i < sizeof(lights) / sizeof(lights[0]); i++)
+		{
+			if (toggles & (1u << i))
+			{
+				set_light(lights[i], !lights[i].on);
+			}
+		}
+		if (allOffRequest.exchange(false))
+		{
+			for (auto &light : lights)
+			{
+				if (light.on)
+				{
+					set_light(light, false);
+				}
+			}
+		}
+
+		// Tractor data, or a simulation when no tractor is on the bus
+		const bool tractor = tractorSeen.load() && ((now - lastTractorMessageMs.load()) < 2000);
+		std::uint32_t speedTenthsKmh = 0;
+		std::uint32_t hitchPercent = 0;
+		std::uint32_t pto = 0;
+		if (tractor)
+		{
+			std::uint32_t mmPerS = (groundSpeedMmS.load() != 0xFFFFFFFF) ? groundSpeedMmS.load() : wheelSpeedMmS.load();
+			speedTenthsKmh = (mmPerS != 0xFFFFFFFF) ? ((mmPerS * 36u + 500u) / 1000u) : 0; // mm/s -> 0.1 km/h
+			hitchPercent = (hitchTenths.load() != 0xFFFFFFFF) ? ((hitchTenths.load() + 5u) / 10u) : 0;
+			pto = (ptoRpm.load() != 0xFFFFFFFF) ? ptoRpm.load() : 0;
+		}
+		else
+		{
+			const float t = now / 1000.0f;
+			speedTenthsKmh = static_cast<std::uint32_t>(80.0f + 60.0f * std::sin(t / 6.0f));      // 2-14 km/h
+			const float phase = std::fmod(t, 20.0f);                                             // hitch up and down
+			hitchPercent = static_cast<std::uint32_t>(phase < 10.0f ? phase * 10.0f : (20.0f - phase) * 10.0f);
+			pto = (std::fmod(t, 30.0f) < 10.0f) ? 0 : ((std::fmod(t, 60.0f) < 30.0f) ? 540 : 1000);
+		}
+
+		if (connected)
+		{
+			if (!wasConnected || (tractor != showingTractor))
+			{
+				// Freshly connected (the terminal's copy has the pool's defaults) or the source changed
+				vtClient->send_change_string_value(pool::STR_SOURCE, tractor ? "TRACTOR  " : "SIMULATED");
+				showingTractor = tractor;
+				ESP_LOGI(TAG, "Data source: %s", tractor ? "TRACTOR (ISOBUS)" : "SIMULATED (no tractor on the bus)");
+			}
+			if (!wasConnected)
+			{
+				// The terminal starts from the pool's defaults: send everything once
+				for (const auto &light : lights)
+				{
+					show_light(light);
+				}
+				vtClient->send_change_numeric_value(pool::VAR_SPEED, speedTenthsKmh);
+				vtClient->send_change_numeric_value(pool::VAR_HITCH, hitchPercent);
+				vtClient->send_change_numeric_value(pool::VAR_PTO, pto);
+			}
+			vtHelper->set_numeric_value(pool::VAR_SPEED, speedTenthsKmh);
+			vtHelper->set_numeric_value(pool::VAR_HITCH, hitchPercent);
+			vtHelper->set_numeric_value(pool::VAR_PTO, pto);
+		}
+		wasConnected = connected;
+
+		if (now - lastStatusLog >= 5000)
+		{
+			lastStatusLog = now;
+			ESP_LOGI(TAG, "address %s 0x%02X | VT %s | %s: %lu.%lu km/h, hitch %lu %%, PTO %lu rpm",
+			         implementCF->get_address_valid() ? "claimed" : "not yet", implementCF->get_address(),
+			         connected ? "connected" : (partnerVT->get_address_valid() ? "found" : "not found"),
+			         tractor ? "tractor" : "simulated", static_cast<unsigned long>(speedTenthsKmh / 10),
+			         static_cast<unsigned long>(speedTenthsKmh % 10), static_cast<unsigned long>(hitchPercent),
+			         static_cast<unsigned long>(pto));
+		}
+		vTaskDelay(pdMS_TO_TICKS(200));
 	}
 }
 
