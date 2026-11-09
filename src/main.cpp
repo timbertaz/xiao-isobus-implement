@@ -82,9 +82,11 @@ static void handle_softkey_event(const isobus::VirtualTerminalClient::VTKeyEvent
 		switch (event.objectID)
 		{
 			case alarm_SoftKey:
+				ESP_LOGI(TAG, "Soft key: alarm -> showing the alarm screen");
 				vtHelper->set_active_data_or_alarm_mask(example_WorkingSet, example_AlarmMask);
 				break;
 			case acknowledgeAlarm_SoftKey:
+				ESP_LOGI(TAG, "Soft key: acknowledge -> back to the main screen");
 				vtHelper->set_active_data_or_alarm_mask(example_WorkingSet, mainRunscreen_DataMask);
 				break;
 			default:
@@ -102,9 +104,11 @@ static void handle_button_event(const isobus::VirtualTerminalClient::VTKeyEvent 
 		{
 			case Plus_Button:
 				vtHelper->increase_numeric_value(ButtonExampleNumber_VarNum);
+				ESP_LOGI(TAG, "Button + -> value %ld", static_cast<long>(vtHelper->get_numeric_value(ButtonExampleNumber_VarNum)) - 214748364L);
 				break;
 			case Minus_Button:
 				vtHelper->decrease_numeric_value(ButtonExampleNumber_VarNum);
+				ESP_LOGI(TAG, "Button - -> value %ld", static_cast<long>(vtHelper->get_numeric_value(ButtonExampleNumber_VarNum)) - 214748364L);
 				break;
 			default:
 				break;
