@@ -314,6 +314,9 @@ static void implement_main()
 	// The label tells the terminal which version of the screen this is: change it whenever the
 	// pool changes, or the terminal shows its stored copy of the old one.
 	vtClient->set_object_pool(0, object_pool_start, (object_pool_end - object_pool_start), "noren1");
+	// The screen is drawn for a 480 x 480 data mask and 60 px soft keys. Real terminals differ
+	// (the tractor's own terminal is bigger): the library rescales the pool to fit before uploading.
+	vtClient->set_object_pool_scaling(0, 480, 60);
 	vtClient->get_vt_soft_key_event_dispatcher().add_listener(handle_softkey_event);
 	vtClient->get_vt_button_event_dispatcher().add_listener(handle_button_event);
 	vtClient->initialize(true);
